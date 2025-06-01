@@ -118,9 +118,9 @@ template <typename R>
 bool champsim::channel::do_add_queue(R& queue, std::size_t queue_size, const typename R::value_type& packet)
 {
   // check occupancy
-  if (std::size(queue) >= queue_size) {
+  if (packet.type == access_type::PREFETCH && std::size(queue) >= queue_size) {
     return false; // cannot handle this request
-  }
+  } 
 
   // Insert the packet ahead of the translation misses
   auto fwd_pkt = packet;

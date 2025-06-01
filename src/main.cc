@@ -70,20 +70,24 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
     }
   };
 
+  
   app.add_flag("-c,--cloudsuite", knob_cloudsuite, "Read all traces using the cloudsuite format");
   app.add_flag("--hide-heartbeat", set_heartbeat_callback, "Hide the heartbeat output");
   auto* warmup_instr_option = app.add_option("-w,--warmup-instructions", warmup_instructions, "The number of instructions in the warmup phase");
   auto* deprec_warmup_instr_option =
-      app.add_option("--warmup_instructions", warmup_instructions, "[deprecated] use --warmup-instructions instead")->excludes(warmup_instr_option);
+  app.add_option("--warmup_instructions", warmup_instructions, "[deprecated] use --warmup-instructions instead")->excludes(warmup_instr_option);
   auto* sim_instr_option = app.add_option("-i,--simulation-instructions", simulation_instructions,
-                                          "The number of instructions in the detailed phase. If not specified, run to the end of the trace.");
-  auto* deprec_sim_instr_option =
-      app.add_option("--simulation_instructions", simulation_instructions, "[deprecated] use --simulation-instructions instead")->excludes(sim_instr_option);
-
-  auto* json_option =
-      app.add_option("--json", json_file_name, "The name of the file to receive JSON output. If no name is specified, stdout will be used")->expected(0, 1);
-
-  app.add_option("traces", trace_names, "The paths to the traces")->required()->expected(NUM_CPUS)->check(CLI::ExistingFile);
+    "The number of instructions in the detailed phase. If not specified, run to the end of the trace.");
+    auto* deprec_sim_instr_option =
+    app.add_option("--simulation_instructions", simulation_instructions, "[deprecated] use --simulation-instructions instead")->excludes(sim_instr_option);
+    
+    auto* json_option =
+    app.add_option("--json", json_file_name, "The name of the file to receive JSON output. If no name is specified, stdout will be used")->expected(0, 1);
+    if(NUM_CPUS > 1){
+      assert(false && "Multiple CPUs are not implemented yet");
+    }
+    
+    app.add_option("traces", trace_names, "The paths to the traces")->required()->check(CLI::ExistingFile);
 
   CLI11_PARSE(app, argc, argv);
 
@@ -110,11 +114,13 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
       [knob_cloudsuite, repeat = simulation_given, i = uint8_t(0)](auto name) mutable { return get_tracereader(name, i++, knob_cloudsuite, repeat); });
 
   std::vector<champsim::phase_info> phases{
-      {champsim::phase_info{"Warmup", true, warmup_instructions, std::vector<std::size_t>(std::size(trace_names), 0), trace_names},
-       champsim::phase_info{"Simulation", false, simulation_instructions, std::vector<std::size_t>(std::size(trace_names), 0), trace_names}}};
+      {champsim::phase_info{"Warmup", true, warmup_instructions, std::vector<std::size_t>(NUM_CPUS == 1 ? 1 : std::size(trace_names), 0), trace_names},
+       champsim::phase_info{"Simulation", false, simulation_instructions, std::vector<std::size_t>(NUM_CPUS == 1 ? 1 : std::size(trace_names), 0), trace_names}}};
 
-  for (auto& p : phases) {
-    std::iota(std::begin(p.trace_index), std::end(p.trace_index), 0);
+  if(NUM_CPUS != 1){
+    for (auto& p : phases) {
+      std::iota(std::begin(p.trace_index), std::end(p.trace_index), 0);
+    }
   }
 
   fmt::print("\n*** ChampSim Multicore Out-of-Order Simulator ***\nWarmup Instructions: {}\nSimulation Instructions: {}\nNumber of CPUs: {}\nPage size: {}\n\n",

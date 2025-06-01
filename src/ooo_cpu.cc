@@ -36,6 +36,7 @@ constexpr long long STAT_PRINTING_PERIOD = 10000000;
 
 long O3_CPU::operate()
 {
+  out_file::set_IPC(num_retired, current_time.time_since_epoch() / clock_period);
   long progress{0};
   progress += retire_rob();                    // retire
   progress += complete_inflight_instruction(); // finalize execution

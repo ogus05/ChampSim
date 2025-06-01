@@ -46,6 +46,7 @@
 #include "operable.h"
 #include "util/to_underlying.h" // for to_underlying
 #include "waitable.h"
+#include "atp/atp.h"
 
 class CACHE : public champsim::operable
 {
@@ -149,7 +150,14 @@ private:
   std::deque<tag_lookup_type> inflight_tag_check{};
   std::deque<tag_lookup_type> translation_stash{};
 
+  bool is_tlb_prefetcher;
+  std::unique_ptr<atp> atp_prefetcher;
+
+  bool check_tlb_pref_hit(tag_lookup_type& handle_pkt);
+
+  
 public:
+  void handle_context_switch(uint32_t process_number);
   std::vector<channel_type*> upper_levels;
   channel_type* lower_level;
   channel_type* lower_translate;
@@ -323,6 +331,15 @@ public:
         prefetch_as_load(b.m_pref_load), match_offset_bits(b.m_wq_full_addr), virtual_prefetch(b.m_va_pref), pref_activate_mask(b.m_pref_act_mask),
         pref_module_pimpl(std::make_unique<prefetcher_module_model<Ps...>>(this)), repl_module_pimpl(std::make_unique<replacement_module_model<Rs...>>(this))
   {
+    if(this->NAME.find("STLB") != std::string::npos){
+      fmt::print("[CACHE] {} is a TLB prefetcher\n", this->NAME);
+      is_tlb_prefetcher = true;
+      atp_prefetcher = std::make_unique<atp>();
+    } else {
+      fmt::print("[CACHE] {} is not a TLB prefetcher\n", this->NAME);
+      is_tlb_prefetcher = false;
+      atp_prefetcher = nullptr;
+    }
   }
 
   CACHE(const CACHE&) = delete;

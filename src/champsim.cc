@@ -29,7 +29,7 @@
 #include "phase_info.h"
 #include "tracereader.h"
 
-constexpr int DEADLOCK_CYCLE{500};
+constexpr int DEADLOCK_CYCLE{50000};
 
 const auto start_time = std::chrono::steady_clock::now();
 
@@ -37,6 +37,31 @@ std::chrono::seconds elapsed_time() { return std::chrono::duration_cast<std::chr
 
 namespace champsim
 {
+static const uint64_t CONTEXT_SWITCH_CYCLE{600 * 1000};
+static int NUMBER_OF_PROCESSES = 0;
+static int current_process = 0;
+bool context_switch(environment& env, champsim::chrono::clock& global_clock)
+{
+    static int64_t last_switch_cycle = 0;
+    static int32_t log_cycle = 0;
+    auto current_cycle = global_clock.now().time_since_epoch().count() / 333;
+
+    out_file::handle_clock(current_cycle);
+    if (current_cycle - last_switch_cycle >= CONTEXT_SWITCH_CYCLE) {
+      last_switch_cycle = current_cycle;
+      if(out_file::handle_log(current_process)){
+        return false;
+      }
+      current_process = (current_process + 1) % NUMBER_OF_PROCESSES;
+      for (auto& cache : env.cache_view()) {
+        cache.get().handle_context_switch(current_process);
+      }
+      fmt::print("context switch to process {}\n", current_process);
+    }
+    return true;
+}
+
+
 long do_cycle(environment& env, std::vector<tracereader>& traces, std::vector<std::size_t> trace_index, champsim::chrono::clock& global_clock)
 {
   auto operables = env.operable_view();
@@ -51,9 +76,16 @@ long do_cycle(environment& env, std::vector<tracereader>& traces, std::vector<st
 
   // Read from trace
   for (O3_CPU& cpu : env.cpu_view()) {
-    auto& trace = traces.at(trace_index.at(cpu.cpu));
-    for (auto pkt_count = cpu.IN_QUEUE_SIZE - static_cast<long>(std::size(cpu.input_queue)); !trace.eof() && pkt_count > 0; --pkt_count) {
-      cpu.input_queue.push_back(trace());
+    if(trace_index.size() == 1 && traces.size() > 1){
+      auto& trace = traces.at(current_process);
+      for (auto pkt_count = cpu.IN_QUEUE_SIZE - static_cast<long>(std::size(cpu.input_queue)); !trace.eof() && pkt_count > 0; --pkt_count) {
+        cpu.input_queue.push_back(trace());
+      }
+    } else{
+      auto& trace = traces.at(trace_index.at(cpu.cpu));
+      for (auto pkt_count = cpu.IN_QUEUE_SIZE - static_cast<long>(std::size(cpu.input_queue)); !trace.eof() && pkt_count > 0; --pkt_count) {
+        cpu.input_queue.push_back(trace());
+      }
     }
   }
 
@@ -87,6 +119,7 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
   while (!std::accumulate(std::begin(phase_complete), std::end(phase_complete), true, std::logical_and{})) {
     auto next_phase_complete = phase_complete;
     global_clock.tick(time_quantum);
+
 
     auto progress = do_cycle(env, traces, trace_index, global_clock);
 
@@ -124,6 +157,10 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
     if (stalled_cycle >= DEADLOCK_CYCLE || livelock_trigger) {
       std::for_each(std::begin(operables), std::end(operables), [](champsim::operable& c) { c.print_deadlock(); });
       abort();
+    }
+
+    if(!context_switch(env, global_clock)){
+      std::fill(std::begin(next_phase_complete), std::end(next_phase_complete), true);
     }
 
     // If any trace reaches EOF, terminate all phases
@@ -186,6 +223,8 @@ std::vector<phase_stats> main(environment& env, std::vector<phase_info>& phases,
   for (champsim::operable& op : env.operable_view()) {
     op.initialize();
   }
+
+  NUMBER_OF_PROCESSES = traces.size();
 
   champsim::chrono::clock global_clock;
   std::vector<phase_stats> results;

@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <numeric>
 #include <fmt/core.h>
+#include <list>
 
 #include "bandwidth.h"
 #include "champsim.h"
@@ -169,6 +170,11 @@ champsim::address CACHE::module_address(const T& element) const
 bool CACHE::handle_fill(const mshr_type& fill_mshr)
 {
   cpu = fill_mshr.cpu;
+  if(is_tlb_prefetcher && fill_mshr.type == access_type::PREFETCH) {
+    // TLB prefetchers do not fill the cache, they only fill PQ.
+    atp_prefetcher.get()->handle_fill(champsim::page_number{fill_mshr.address}, champsim::page_number{fill_mshr.data_promise->data});
+    return true;
+  }
 
   // find victim
   auto [set_begin, set_end] = get_set_span(fill_mshr.address);
@@ -189,6 +195,7 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
                (fill_mshr.time_enqueued.time_since_epoch()) / clock_period, (current_time.time_since_epoch()) / clock_period);
   }
 
+  // writeback dirty block
   if (way != set_end && way->valid && way->dirty) {
     request_type writeback_packet;
 
@@ -250,17 +257,32 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
 {
   cpu = handle_pkt.cpu;
-
   // access cache
   auto [set_begin, set_end] = get_set_span(handle_pkt.address);
   auto way = std::find_if(set_begin, set_end, [matcher = matches_address(handle_pkt.address)](const auto& x) { return x.valid && matcher(x); });
   const auto hit = (way != set_end);
   const auto useful_prefetch = (hit && way->prefetch && !handle_pkt.prefetch_from_this);
 
+  if(is_tlb_prefetcher){
+    if(hit){
+      out_file::TLB_Miss_rate.first += 1;
+    } else{
+      out_file::TLB_Miss_rate.second += 1;
+    }
+  }
+
+  bool prefetch_hit = false;
+
+  if(is_tlb_prefetcher && !hit && handle_pkt.type == access_type::LOAD){
+    prefetch_hit = check_tlb_pref_hit(const_cast<tag_lookup_type&>(handle_pkt));
+  }
+
+  bool hit_result = hit || prefetch_hit;
+
   if constexpr (champsim::debug_print) {
     fmt::print("[{}] {} instr_id: {} address: {} v_address: {} data: {} set: {} way: {} ({}) type: {} cycle: {}\n", NAME, __func__, handle_pkt.instr_id,
                handle_pkt.address, handle_pkt.v_address, handle_pkt.data, get_set_index(handle_pkt.address), std::distance(set_begin, way),
-               hit ? "HIT" : "MISS", access_type_names.at(champsim::to_underlying(handle_pkt.type)), current_time.time_since_epoch() / clock_period);
+               hit_result ? "HIT" : "MISS", access_type_names.at(champsim::to_underlying(handle_pkt.type)), current_time.time_since_epoch() / clock_period);
   }
 
   auto metadata_thru = handle_pkt.pf_metadata;
@@ -273,7 +295,7 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
   impl_update_replacement_state(handle_pkt.cpu, get_set_index(handle_pkt.address), way_idx, module_address(handle_pkt), handle_pkt.ip, {}, handle_pkt.type,
                                 hit);
 
-  if (hit) {
+  if (hit_result) {
     sim_stats.hits.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
     response_type response{handle_pkt.address, handle_pkt.v_address, way->data, metadata_thru, handle_pkt.instr_depend_on_me};
@@ -290,7 +312,7 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
     }
   }
 
-  return hit;
+  return (hit_result);
 }
 
 auto CACHE::mshr_and_forward_packet(const tag_lookup_type& handle_pkt) -> std::pair<mshr_type, request_type>
@@ -363,6 +385,17 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
     // Allocate an MSHR
     if (mshr_pkt.second.response_requested) {
       MSHR.emplace_back(std::move(mshr_pkt.first));
+    }
+  }
+
+  
+  if(is_tlb_prefetcher && handle_pkt.type == access_type::LOAD) {
+    std::list<champsim::page_number> predicted_pte_list
+      = atp_prefetcher.get()->handle_miss(champsim::page_number{handle_pkt.v_address}, handle_pkt.ip);
+    // TLB prefetchers do not fill the cache, they only issue prefetches
+    for(auto& pte : predicted_pte_list) {
+      fmt::print("{}\t{}\n", handle_pkt.v_address, pte);
+      const_cast<CACHE*>(this)->prefetch_line(champsim::address{champsim::splice(pte, champsim::page_offset{0})}, false, handle_pkt.pf_metadata);
     }
   }
 
@@ -587,9 +620,15 @@ bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint3
   pf_packet.cpu = cpu;
   pf_packet.address = pf_addr;
   pf_packet.v_address = virtual_prefetch ? pf_addr : champsim::address{};
-  pf_packet.is_translated = !virtual_prefetch;
+  pf_packet.is_translated = !virtual_prefetch || is_tlb_prefetcher;
 
-  internal_PQ.emplace_back(pf_packet, true, !fill_this_level);
+  if(is_tlb_prefetcher){
+    if(lower_level->add_rq(pf_packet)){
+      MSHR.emplace_back(tag_lookup_type{pf_packet, true, false}, current_time);
+    }
+  } else{
+    internal_PQ.emplace_back(pf_packet, true, !fill_this_level);
+  }
   ++sim_stats.pf_issued;
 
   return true;
@@ -661,6 +700,7 @@ void CACHE::finish_translation(const response_type& packet)
   }
 }
 
+// Executed only in data cache.
 void CACHE::issue_translation(tag_lookup_type& q_entry) const
 {
   if (!q_entry.translate_issued && !q_entry.is_translated) {
@@ -686,6 +726,102 @@ void CACHE::issue_translation(tag_lookup_type& q_entry) const
                    access_type_names.at(champsim::to_underlying(q_entry.type)));
       }
     }
+  }
+}
+
+
+bool CACHE::check_tlb_pref_hit(tag_lookup_type& handle_pkt) {
+    auto vpn = champsim::page_number{handle_pkt.v_address};
+    if (is_tlb_prefetcher && atp_prefetcher->has_pte(vpn))
+    {
+      champsim::page_number pte = atp_prefetcher->pop_pte(vpn);
+      cpu = handle_pkt.cpu; // 호출 시점에 따라 context 유지 필요
+
+      auto [set_begin, set_end] = get_set_span(handle_pkt.v_address);
+      auto way = std::find_if_not(set_begin, set_end, [](auto x) { return x.valid; });
+
+      if (way == set_end) {
+        way = std::next(set_begin, impl_find_victim(cpu, 0, get_set_index(handle_pkt.v_address), &*set_begin, handle_pkt.ip, handle_pkt.v_address, access_type::PREFETCH));
+      }
+
+      const auto way_idx = std::distance(set_begin, way);
+
+      if (way != set_end && way->valid && way->dirty) {
+        request_type writeback_packet;
+
+        writeback_packet.cpu = handle_pkt.cpu;
+        writeback_packet.address = way->address;
+        writeback_packet.data = way->data;
+        writeback_packet.instr_id = handle_pkt.instr_id;
+        writeback_packet.ip = champsim::address{};
+        writeback_packet.type = access_type::WRITE;
+        writeback_packet.pf_metadata = way->pf_metadata;
+        writeback_packet.response_requested = false;
+
+        if constexpr (champsim::debug_print) {
+          fmt::print("[{}] {} evict address: {:#x} v_address: {:#x} prefetch_metadata: {}\n", NAME, __func__, writeback_packet.address, writeback_packet.v_address,
+                    handle_pkt.pf_metadata);
+        }
+
+        auto success = lower_level->add_wq(writeback_packet);
+        
+        if (!success) {
+          return false;
+        }
+      }
+
+      champsim::address evicting_address{};
+      if (way != set_end && way->valid) {
+        evicting_address = module_address(*way);
+      }
+
+      impl_replacement_cache_fill(cpu, get_set_index(handle_pkt.v_address), way_idx, handle_pkt.v_address, handle_pkt.ip, evicting_address, access_type::PREFETCH);
+
+      // fill_mshr 없이 직접 block 구성
+      CACHE::BLOCK new_block;
+      new_block.valid = true;
+      new_block.address = handle_pkt.address; // 가상 주소로 설정
+      new_block.v_address = handle_pkt.v_address;
+      new_block.data = champsim::address{champsim::splice(pte, champsim::page_offset{0})}; // 일반적으로 PTE일 수 있음
+      new_block.prefetch = true;
+      new_block.dirty = false;
+      new_block.pf_metadata = handle_pkt.pf_metadata;
+
+      *way = new_block;
+
+      fmt::print("[{}] PQ HIT promote TLB fill: v_addr: {}, p_addr: {}, set: {}, way: {}\n",
+                NAME, handle_pkt.v_address, pte, get_set_index(handle_pkt.v_address), way_idx);
+      return true;
+    } else{
+      return false;
+    }
+}
+
+void CACHE::handle_context_switch(uint32_t process_number)
+{
+  // // Reset MSHRs and inflight requests
+  // inflight_writes.clear();
+  // inflight_tag_check.clear();
+  // translation_stash.clear();
+  
+  // // Reset Prefetch Queue
+  // MSHR.clear();
+  internal_PQ.clear();
+
+  if (is_tlb_prefetcher) {
+    for (auto& blk : block) {
+      blk.valid = false;
+      blk.dirty = false;
+      blk.prefetch = false;
+    }
+  }
+  // Reinitialize prefetcher & replacement modules
+  // impl_prefetcher_initialize();
+  // impl_initialize_replacement();
+
+  // Reset ATP TLB prefetcher if applicable
+  if (is_tlb_prefetcher) {
+    atp_prefetcher->store_and_fill_context(process_number);
   }
 }
 
